@@ -1,0 +1,29 @@
+---
+# This net-attach-def uses the sbr plugin to install a static gateway in the
+# source-based routing table. Update master and the IP range for each cluster.
+apiVersion: "k8s.cni.cncf.io/v1"
+kind: NetworkAttachmentDefinition
+metadata:
+  name: sbr-gateway
+spec:
+  config: '{
+      "cniVersion": "1.0.0",
+      "name": "sbr-gateway",
+      "plugins": [
+        {
+          "type": "macvlan",
+          "master": "eth0",
+          "mode": "bridge",
+          "ipam": {
+            "type": "host-local",
+            "subnet": "192.168.1.0/24",
+            "rangeStart": "192.168.1.100",
+            "rangeEnd": "192.168.1.200"
+          }
+        },
+        {
+          "type": "sbr",
+          "gateways": ["192.168.1.2"]
+        }
+      ]
+    }'

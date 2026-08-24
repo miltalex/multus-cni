@@ -14,6 +14,7 @@ More specifically, these examples show:
 * A resource definition with a daemonset that places the `.conf` on each node in the cluster.
 * A CRD defining the "networks" @ `network-attachment-definitions.k8s.cni.cncf.io` 
 * CRD objects containing the configuration for both Flannel & macvlan.
+* A chained SBR configuration with a static gateway in `sbr-gateway.yml`.
 
 ## Quick-start instructions
 

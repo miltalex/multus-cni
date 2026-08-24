@@ -2,6 +2,8 @@
 set -e
 
 DEST_DIR="bin"
+# containernetworking/plugins#1217 adds static gateways to the sbr plugin.
+SBR_VERSION="v1.9.2-0.20260413143815-025aca14c330"
 
 if [ ! -d ${DEST_DIR} ]; then
 	mkdir ${DEST_DIR}
@@ -82,3 +84,15 @@ echo "Building cert-approver"
 go build -o "${DEST_DIR}"/cert-approver ${BUILD_ARGS} -ldflags "${LDFLAGS}" ./cmd/cert-approver
 echo "Building passthru CNI"
 go build -o "${DEST_DIR}"/passthru ${BUILD_ARGS} -ldflags "${LDFLAGS}" ./cmd/passthru-cni
+echo "Building sbr CNI"
+SBR_BUILD_DIR=$(mktemp -d)
+trap 'rm -rf "${SBR_BUILD_DIR}"' EXIT
+SBR_GOMODCACHE=$(go env GOMODCACHE)
+GOFLAGS="${GOFLAGS:-} -mod=mod" GOPATH="${SBR_BUILD_DIR}" GOMODCACHE="${SBR_GOMODCACHE}" go install "github.com/containernetworking/plugins/plugins/meta/sbr@${SBR_VERSION}"
+SBR_BIN_PATH="${SBR_BUILD_DIR}/bin/sbr"
+if [ ! -f "${SBR_BIN_PATH}" ]; then
+	SBR_BIN_PATH="${SBR_BUILD_DIR}/bin/$(go env GOOS)_$(go env GOARCH)/sbr"
+fi
+cp "${SBR_BIN_PATH}" "${DEST_DIR}/sbr"
+rm -rf "${SBR_BUILD_DIR}"
+trap - EXIT

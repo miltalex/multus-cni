@@ -1070,10 +1070,10 @@ var _ = Describe("config operations", func() {
 		Expect(ok).To(BeTrue())
 		Expect(k8s["kubeconfig"]).To(Equal("/etc/cni/net.d/calico-kubeconfig"))
 
-	ipam, ok := calico["ipam"].(map[string]interface{})
-	Expect(ok).To(BeTrue())
-	Expect(ipam["type"]).To(Equal("calico-ipam"))
-	Expect(ipam["assign_ipv4"]).To(Equal("true"))
+		ipam, ok := calico["ipam"].(map[string]interface{})
+		Expect(ok).To(BeTrue())
+		Expect(ipam["type"]).To(Equal("calico-ipam"))
+		Expect(ipam["assign_ipv4"]).To(Equal("true"))
 	})
 
 	It("LoadDelegateNetConfFromConfList keeps plugins appended from a subdirectory chain", func() {
@@ -1107,6 +1107,34 @@ var _ = Describe("config operations", func() {
 		Expect(ok).To(BeTrue())
 		Expect(plugins).To(HaveLen(2))
 		Expect(plugins[1].(map[string]interface{})["type"]).To(Equal("bandwidth"))
+	})
+
+	It("LoadDelegateNetConfFromConfList preserves SBR static gateways", func() {
+		conflist := `{
+			"name": "sbr-gateway",
+			"cniVersion": "1.0.0",
+			"plugins": [
+				{"type": "macvlan"},
+				{"type": "sbr", "gateways": ["192.168.1.2"]}
+			]
+		}`
+
+		confList, err := libcni.NetworkConfFromBytes([]byte(conflist))
+		Expect(err).NotTo(HaveOccurred())
+
+		delegate, err := LoadDelegateNetConfFromConfList(confList, nil, "", "")
+		Expect(err).NotTo(HaveOccurred())
+
+		var parsed struct {
+			Plugins []struct {
+				Type     string   `json:"type"`
+				Gateways []string `json:"gateways"`
+			} `json:"plugins"`
+		}
+		Expect(json.Unmarshal(delegate.Bytes, &parsed)).To(Succeed())
+		Expect(parsed.Plugins).To(HaveLen(2))
+		Expect(parsed.Plugins[1].Type).To(Equal("sbr"))
+		Expect(parsed.Plugins[1].Gateways).To(Equal([]string{"192.168.1.2"}))
 	})
 
 	It("InjectCNIVersionInConfList sets cniVersion without dropping fields", func() {
