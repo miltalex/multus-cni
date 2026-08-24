@@ -109,6 +109,144 @@ func rawConfListBytes(confList *libcni.NetworkConfigList) ([]byte, error) {
 	return json.Marshal(rawList)
 }
 
+// mergeConfListBytes preserves runtime fields injected into the legacy Bytes
+// after CNINetworkConfigList was built. Other fields must continue to come
+// from the lossless configuration.
+func mergeConfListBytes(losslessBytes, housekeepingBytes []byte) ([]byte, error) {
+	if len(housekeepingBytes) == 0 {
+		return losslessBytes, nil
+	}
+
+	var lossless, housekeeping map[string]json.RawMessage
+	if err := json.Unmarshal(losslessBytes, &lossless); err != nil {
+		return nil, logging.Errorf("mergeConfListBytes: failed to unmarshal lossless bytes: %v", err)
+	}
+	if err := json.Unmarshal(housekeepingBytes, &housekeeping); err != nil {
+		return nil, logging.Errorf("mergeConfListBytes: failed to unmarshal housekeeping bytes: %v", err)
+	}
+
+	var losslessPlugins, housekeepingPlugins []json.RawMessage
+	if err := json.Unmarshal(lossless["plugins"], &losslessPlugins); err != nil {
+		return nil, logging.Errorf("mergeConfListBytes: failed to unmarshal lossless plugins: %v", err)
+	}
+	if err := json.Unmarshal(housekeeping["plugins"], &housekeepingPlugins); err != nil {
+		return nil, logging.Errorf("mergeConfListBytes: failed to unmarshal housekeeping plugins: %v", err)
+	}
+	if len(losslessPlugins) != len(housekeepingPlugins) {
+		return nil, logging.Errorf("mergeConfListBytes: plugin count differs between legacy and housekeeping bytes: %d != %d", len(losslessPlugins), len(housekeepingPlugins))
+	}
+
+	for idx := range losslessPlugins {
+		var losslessPlugin, housekeepingPlugin map[string]json.RawMessage
+		if err := json.Unmarshal(losslessPlugins[idx], &losslessPlugin); err != nil {
+			return nil, logging.Errorf("mergeConfListBytes: failed to unmarshal lossless plugin #%d: %v", idx, err)
+		}
+		if err := json.Unmarshal(housekeepingPlugins[idx], &housekeepingPlugin); err != nil {
+			return nil, logging.Errorf("mergeConfListBytes: failed to unmarshal housekeeping plugin #%d: %v", idx, err)
+		}
+		for _, key := range []string{"deviceID", "pciBusID"} {
+			if value, ok := housekeepingPlugin[key]; ok {
+				losslessPlugin[key] = value
+			}
+		}
+		if housekeepingArgs, ok := housekeepingPlugin["args"]; ok {
+			args, err := mergeCNIArgs(losslessPlugin["args"], housekeepingArgs)
+			if err != nil {
+				return nil, logging.Errorf("mergeConfListBytes: failed to merge plugin #%d args: %v", idx, err)
+			}
+			losslessPlugin["args"] = args
+		}
+		pluginBytes, err := json.Marshal(losslessPlugin)
+		if err != nil {
+			return nil, logging.Errorf("mergeConfListBytes: failed to marshal plugin #%d: %v", idx, err)
+		}
+		losslessPlugins[idx] = pluginBytes
+	}
+
+	pluginsBytes, err := json.Marshal(losslessPlugins)
+	if err != nil {
+		return nil, logging.Errorf("mergeConfListBytes: failed to marshal plugins: %v", err)
+	}
+	lossless["plugins"] = pluginsBytes
+	return json.Marshal(lossless)
+}
+
+func mergeCNIArgs(losslessBytes, housekeepingBytes json.RawMessage) ([]byte, error) {
+	var lossless, housekeeping map[string]json.RawMessage
+	if len(losslessBytes) != 0 {
+		if err := json.Unmarshal(losslessBytes, &lossless); err != nil {
+			return nil, logging.Errorf("mergeCNIArgs: failed to unmarshal lossless args: %v", err)
+		}
+	} else {
+		lossless = map[string]json.RawMessage{}
+	}
+	if err := json.Unmarshal(housekeepingBytes, &housekeeping); err != nil {
+		return nil, logging.Errorf("mergeCNIArgs: failed to unmarshal housekeeping args: %v", err)
+	}
+
+	housekeepingCNI, ok := housekeeping["cni"]
+	if !ok {
+		return json.Marshal(lossless)
+	}
+	var losslessCNI, housekeepingCNIMap map[string]json.RawMessage
+	if losslessCNIBytes, ok := lossless["cni"]; ok {
+		if err := json.Unmarshal(losslessCNIBytes, &losslessCNI); err != nil {
+			return nil, logging.Errorf("mergeCNIArgs: failed to unmarshal lossless cni args: %v", err)
+		}
+	} else {
+		losslessCNI = map[string]json.RawMessage{}
+	}
+	if err := json.Unmarshal(housekeepingCNI, &housekeepingCNIMap); err != nil {
+		return nil, logging.Errorf("mergeCNIArgs: failed to unmarshal housekeeping cni args: %v", err)
+	}
+	for key, value := range housekeepingCNIMap {
+		losslessCNI[key] = value
+	}
+	cniBytes, err := json.Marshal(losslessCNI)
+	if err != nil {
+		return nil, logging.Errorf("mergeCNIArgs: failed to marshal cni args: %v", err)
+	}
+	lossless["cni"] = cniBytes
+	return json.Marshal(lossless)
+}
+
+// UnmarshalJSON restores delegate Bytes from the pre-#1521 scratch-cache
+// representation. Those caches include CNINetworkConfigList with lossless raw
+// plugin bytes, while Bytes was marshaled from the lossy NetConfList. The
+// legacy field is used only while decoding; Bytes remains the sole source of
+// truth after the delegate is loaded.
+func (delegateConf *DelegateNetConf) UnmarshalJSON(data []byte) error {
+	type delegateNetConf DelegateNetConf
+	legacy := struct {
+		*delegateNetConf
+		CNINetworkConfigList *libcni.NetworkConfigList `json:"CNINetworkConfigList"`
+	}{
+		delegateNetConf: (*delegateNetConf)(delegateConf),
+	}
+
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return logging.Errorf("DelegateNetConf: error unmarshalling delegate config: %v", err)
+	}
+
+	// Direct-plugin delegates in old caches also carried this field, but it was
+	// empty because only conflist delegates populated CNINetworkConfigList.
+	if legacy.CNINetworkConfigList == nil ||
+		(len(legacy.CNINetworkConfigList.Bytes) == 0 && len(legacy.CNINetworkConfigList.Plugins) == 0) {
+		return nil
+	}
+
+	bytes, err := rawConfListBytes(legacy.CNINetworkConfigList)
+	if err != nil {
+		return logging.Errorf("DelegateNetConf: failed to restore Bytes from legacy CNINetworkConfigList: %v", err)
+	}
+	bytes, err = mergeConfListBytes(bytes, delegateConf.Bytes)
+	if err != nil {
+		return logging.Errorf("DelegateNetConf: failed to merge legacy CNINetworkConfigList with Bytes: %v", err)
+	}
+	delegateConf.Bytes = bytes
+	return nil
+}
+
 // InjectCNIVersionInConfList sets the cniVersion field on a conflist JSON
 // without losing any other field. It is used on the DEL path to backfill the
 // cniVersion onto the raw bytes; marshaling the structured NetConfList instead

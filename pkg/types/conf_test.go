@@ -1037,7 +1037,7 @@ var _ = Describe("config operations", func() {
 					"mtu": 1500,
 					"policy": {"type": "k8s"},
 					"kubernetes": {"kubeconfig": "/etc/cni/net.d/calico-kubeconfig"},
-					"ipam": {"type": "calico-ipam"}
+					"ipam": {"type": "calico-ipam", "assign_ipv4": "true"}
 				},
 				{
 					"type": "portmap",
@@ -1070,9 +1070,10 @@ var _ = Describe("config operations", func() {
 		Expect(ok).To(BeTrue())
 		Expect(k8s["kubeconfig"]).To(Equal("/etc/cni/net.d/calico-kubeconfig"))
 
-		ipam, ok := calico["ipam"].(map[string]interface{})
-		Expect(ok).To(BeTrue())
-		Expect(ipam["type"]).To(Equal("calico-ipam"))
+	ipam, ok := calico["ipam"].(map[string]interface{})
+	Expect(ok).To(BeTrue())
+	Expect(ipam["type"]).To(Equal("calico-ipam"))
+	Expect(ipam["assign_ipv4"]).To(Equal("true"))
 	})
 
 	It("LoadDelegateNetConfFromConfList keeps plugins appended from a subdirectory chain", func() {
@@ -1130,6 +1131,112 @@ var _ = Describe("config operations", func() {
 		k8s, ok := calico["kubernetes"].(map[string]interface{})
 		Expect(ok).To(BeTrue())
 		Expect(k8s["kubeconfig"]).To(Equal("/etc/cni/net.d/calico-kubeconfig"))
+	})
+
+	It("restores lossless Bytes from a pre-1521 scratch cache", func() {
+		conflist := `{
+			"name": "k8s-pod-network",
+			"cniVersion": "0.3.1",
+			"plugins": [
+				{
+					"type": "calico",
+					"datastore_type": "kubernetes",
+					"kubernetes": {"kubeconfig": "/etc/cni/net.d/calico-kubeconfig"},
+					"ipam": {"type": "calico-ipam", "assign_ipv4": "true"},
+					"args": {"other": {"keep": "me"}, "cni": {"existing": "value"}}
+				}
+			]
+		}`
+
+		confList, err := libcni.NetworkConfFromBytes([]byte(conflist))
+		Expect(err).NotTo(HaveOccurred())
+		delegate, err := LoadDelegateNetConfFromConfList(confList, nil, "", "")
+		Expect(err).NotTo(HaveOccurred())
+
+		// Before #1521, scratch-cache Bytes came from the structured NetConfList
+		// and dropped plugin-specific fields, while CNINetworkConfigList retained
+		// their raw bytes.
+		delegate.Bytes, err = json.Marshal(delegate.ConfList)
+		Expect(err).NotTo(HaveOccurred())
+		var housekeeping map[string]interface{}
+		Expect(json.Unmarshal(delegate.Bytes, &housekeeping)).To(Succeed())
+		housekeepingPlugins, ok := housekeeping["plugins"].([]interface{})
+		Expect(ok).To(BeTrue())
+		housekeepingPlugin, ok := housekeepingPlugins[0].(map[string]interface{})
+		Expect(ok).To(BeTrue())
+		housekeepingPlugin["deviceID"] = "0000:00:00.0"
+		housekeepingPlugin["pciBusID"] = "0000:00:00.0"
+		housekeepingPlugin["args"] = map[string]interface{}{"cni": map[string]interface{}{"foo": "bar"}}
+		delegate.Bytes, err = json.Marshal(housekeeping)
+		Expect(err).NotTo(HaveOccurred())
+		delegateJSON, err := json.Marshal(delegate)
+		Expect(err).NotTo(HaveOccurred())
+
+		var cache map[string]json.RawMessage
+		Expect(json.Unmarshal(delegateJSON, &cache)).To(Succeed())
+		legacyList, err := json.Marshal(confList)
+		Expect(err).NotTo(HaveOccurred())
+		cache["CNINetworkConfigList"] = legacyList
+		cacheJSON, err := json.Marshal(cache)
+		Expect(err).NotTo(HaveOccurred())
+
+		var restored DelegateNetConf
+		Expect(json.Unmarshal(cacheJSON, &restored)).To(Succeed())
+		var restoredConfig map[string]interface{}
+		Expect(json.Unmarshal(restored.Bytes, &restoredConfig)).To(Succeed())
+		restoredPlugins, ok := restoredConfig["plugins"].([]interface{})
+		Expect(ok).To(BeTrue())
+		restoredPlugin, ok := restoredPlugins[0].(map[string]interface{})
+		Expect(ok).To(BeTrue())
+		Expect(restoredPlugin["datastore_type"]).To(Equal("kubernetes"))
+		Expect(restoredPlugin["deviceID"]).To(Equal("0000:00:00.0"))
+		Expect(restoredPlugin["pciBusID"]).To(Equal("0000:00:00.0"))
+		Expect(restoredPlugin["args"]).To(Equal(map[string]interface{}{
+			"other": map[string]interface{}{"keep": "me"},
+			"cni":   map[string]interface{}{"existing": "value", "foo": "bar"},
+		}))
+		restoredIPAM, ok := restoredPlugin["ipam"].(map[string]interface{})
+		Expect(ok).To(BeTrue())
+		Expect(restoredIPAM["assign_ipv4"]).To(Equal("true"))
+		restoredKubernetes, ok := restoredPlugin["kubernetes"].(map[string]interface{})
+		Expect(ok).To(BeTrue())
+		Expect(restoredKubernetes["kubeconfig"]).To(Equal("/etc/cni/net.d/calico-kubeconfig"))
+
+		// The compatibility field is consumed during decoding and is not retained
+		// as a second source of truth when the delegate is written again.
+		restoredJSON, err := json.Marshal(restored)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(restoredJSON).NotTo(ContainSubstring("CNINetworkConfigList"))
+	})
+
+	It("returns an error for an invalid legacy CNINetworkConfigList", func() {
+		cache := []byte(`{
+			"Bytes": "eyJ0eXBlIjoiYnJpZGdlIn0=",
+			"CNINetworkConfigList": {"Bytes": "bm90LWpzb24=", "Plugins": []}
+		}`)
+
+		var delegate DelegateNetConf
+		err := json.Unmarshal(cache, &delegate)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("failed to restore Bytes from legacy CNINetworkConfigList"))
+	})
+
+	It("keeps direct-plugin Bytes when the legacy conflist field is empty", func() {
+		delegate, err := LoadDelegateNetConf([]byte(`{"type":"bridge","bridge":"br0"}`), nil, "", "")
+		Expect(err).NotTo(HaveOccurred())
+		originalBytes := append([]byte(nil), delegate.Bytes...)
+
+		delegateJSON, err := json.Marshal(delegate)
+		Expect(err).NotTo(HaveOccurred())
+		var cache map[string]json.RawMessage
+		Expect(json.Unmarshal(delegateJSON, &cache)).To(Succeed())
+		cache["CNINetworkConfigList"] = []byte(`{}`)
+		cacheJSON, err := json.Marshal(cache)
+		Expect(err).NotTo(HaveOccurred())
+
+		var restored DelegateNetConf
+		Expect(json.Unmarshal(cacheJSON, &restored)).To(Succeed())
+		Expect(restored.Bytes).To(Equal(originalBytes))
 	})
 
 })
